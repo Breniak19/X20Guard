@@ -15,19 +15,14 @@ jobs:
     - name: Descargar el código
       uses: actions/checkout@v4
 
-    - name: Configurar MSBuild
-      uses: microsoft/setup-msbuild@v2
+    - name: Configurar .NET 8
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
 
-    - name: Configurar NuGet
-      uses: nuget/setup-nuget@v2
-
-    - name: Restaurar dependencias
-      # Restaura los paquetes listados por si llegas a usar alguno
-      run: nuget restore
-
-    - name: Compilar (Release)
-      # Compila el proyecto usando MSBuild en modo Release
-      run: msbuild /p:Configuration=Release
+    - name: Compilar y empaquetar en un solo archivo (Single-File)
+      # Esto fusiona el .exe, el .dll y los .json en un solo ejecutable funcional
+      run: dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true --self-contained false -o ./publish_output
 
     - name: Crear Tag y Lanzamiento
       uses: softprops/action-gh-release@v2
@@ -39,12 +34,10 @@ jobs:
           🚀 Nueva versión compilada automáticamente.
           - Utilidad silenciosa para forzar Overclock de monitor (100Hz).
           - Soluciona el error de "Handshake" de Intel HD Graphics al salir de suspensión.
-          - Iconos de estado dinámicos integrados (Verde/Rojo/Gris).
-          - Prioridad de proceso en tiempo real para evitar cierres del sistema.
-          - Sistema "Caja Negra" de registro de errores.
+          - Empaquetado como un solo archivo (.exe) nativo para Windows x64.
         draft: false
         prerelease: false
-        # Busca el ejecutable en CUALQUIER subcarpeta dentro de Release
-        files: '**/bin/Release/**/*.exe'
+        # Ahora apuntamos directamente a la carpeta de publicación que creamos arriba
+        files: './publish_output/X20Guard.exe'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
