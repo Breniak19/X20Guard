@@ -44,7 +44,7 @@ jobs:
           - Sistema "Caja Negra" de registro de errores.
         draft: false
         prerelease: false
-        # Busca el ejecutable exacto de tu proyecto X20Guard
-        files: '**/bin/Release/X20Guard.exe'
+        # Busca el ejecutable en CUALQUIER subcarpeta dentro de Release
+        files: '**/bin/Release/**/*.exe'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
