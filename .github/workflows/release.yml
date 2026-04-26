@@ -1,0 +1,50 @@
+name: Compilar y Publicar X20Guard
+
+on:
+  push:
+    branches: [ "master", "main" ] # Escucha ambas ramas
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # Necesitamos permisos para crear el lanzamiento y subir archivos
+    permissions:
+      contents: write
+
+    steps:
+    - name: Descargar el código
+      uses: actions/checkout@v4
+
+    - name: Configurar MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Configurar NuGet
+      uses: nuget/setup-nuget@v2
+
+    - name: Restaurar dependencias
+      # Restaura los paquetes listados por si llegas a usar alguno
+      run: nuget restore
+
+    - name: Compilar (Release)
+      # Compila el proyecto usando MSBuild en modo Release
+      run: msbuild /p:Configuration=Release
+
+    - name: Crear Tag y Lanzamiento
+      uses: softprops/action-gh-release@v2
+      with:
+        # Usa el número de ejecución para que cada versión sea única
+        tag_name: v1.0.${{ github.run_number }}
+        name: X20Guard v1.0.${{ github.run_number }}
+        body: |
+          🚀 Nueva versión compilada automáticamente.
+          - Utilidad silenciosa para forzar Overclock de monitor (100Hz).
+          - Soluciona el error de "Handshake" de Intel HD Graphics al salir de suspensión.
+          - Iconos de estado dinámicos integrados (Verde/Rojo/Gris).
+          - Prioridad de proceso en tiempo real para evitar cierres del sistema.
+          - Sistema "Caja Negra" de registro de errores.
+        draft: false
+        prerelease: false
+        # Busca el ejecutable exacto de tu proyecto X20Guard
+        files: '**/bin/Release/X20Guard.exe'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
