@@ -6,22 +6,24 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Management; // Necesario para buscar la Tarjeta Gráfica
 
 namespace X20Guard
 {
-    
     static class Program
     {
         [STAThread]
         static void Main()
         {
-            // --- SISTEMA DE CAJA NEGRA (Captura errores fatales) ---
             Application.ThreadException += (s, e) => LogFatalError(e.Exception);
             AppDomain.CurrentDomain.UnhandledException += (s, e) => LogFatalError(e.ExceptionObject as Exception);
 
             try
             {
-                EstablecerPrioridadTiempoReal();
+                using (Process p = Process.GetCurrentProcess())
+                {
+                    p.PriorityClass = ProcessPriorityClass.High;
+                }
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
@@ -42,29 +44,7 @@ namespace X20Guard
                 string filePath = Path.Combine(desktopPath, "X20Guard_Error.txt");
                 File.AppendAllText(filePath, $"[{DateTime.Now}] CRASHEO FATAL: {ex.Message}{Environment.NewLine}{ex.StackTrace}{Environment.NewLine}");
             }
-            catch { /* Evitar bucle de errores */ }
-        }
-
-        private static void EstablecerPrioridadTiempoReal()
-        {
-            try
-            {
-                using (Process p = Process.GetCurrentProcess())
-                {
-                    p.PriorityClass = ProcessPriorityClass.RealTime; // Prioridad Máxima
-                }
-            }
-            catch
-            {
-                try
-                {
-                    using (Process p = Process.GetCurrentProcess())
-                    {
-                        p.PriorityClass = ProcessPriorityClass.High; // Fallback
-                    }
-                }
-                catch { } // Silencioso si falta permisos de admin
-            }
+            catch { /* Evitar bucle */ }
         }
     }
 
@@ -74,9 +54,13 @@ namespace X20Guard
         private Icon iconGreen;
         private Icon iconRed;
         private Icon iconGray;
-
         private System.Windows.Forms.Timer statusTimer;
 
+        // Banderas de seguridad MUY IMPORTANTES para el reinicio de GPU
+        private bool isProcessingChange = false;
+        private DateTime lastEventTime = DateTime.MinValue;
+
+        // --- P/Invoke para LEER la pantalla ---
         [DllImport("user32.dll")]
         public static extern bool EnumDisplaySettings(string? deviceName, int modeNum, ref DEVMODE devMode);
 
@@ -85,40 +69,16 @@ namespace X20Guard
         [StructLayout(LayoutKind.Sequential)]
         public struct DEVMODE
         {
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
-            public string dmDeviceName;
-            public short dmSpecVersion;
-            public short dmDriverVersion;
-            public short dmSize;
-            public short dmDriverExtra;
-            public int dmFields;
-            public int dmPositionX;
-            public int dmPositionY;
-            public int dmDisplayOrientation;
-            public int dmDisplayFixedOutput;
-            public short dmColor;
-            public short dmDuplex;
-            public short dmYResolution;
-            public short dmTTOption;
-            public short dmCollate;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
-            public string dmFormName;
-            public short dmLogPixels;
-            public int dmBitsPerPel;
-            public int dmPelsWidth;
-            public int dmPelsHeight;
-            public int dmDisplayFlags;
-            public int dmDisplayFrequency;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public short dmSpecVersion; public short dmDriverVersion; public short dmSize;
+            public short dmDriverExtra; public int dmFields; public int dmPositionX;
+            public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;
+            public short dmColor; public short dmDuplex; public short dmYResolution;
+            public short dmTTOption; public short dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth;
+            public int dmPelsHeight; public int dmDisplayFlags; public int dmDisplayFrequency;
         }
-
-        [DllImport("user32.dll")]
-        static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
-
-        private const byte VK_LWIN = 0x5B;
-        private const byte VK_CONTROL = 0x11;
-        private const byte VK_SHIFT = 0x10;
-        private const byte VK_B = 0x42;
-        private const uint KEYEVENTF_KEYUP = 0x0002;
 
         public X20ApplicationContext()
         {
@@ -134,11 +94,11 @@ namespace X20Guard
                 Text = "X20 Guard - Iniciando..."
             };
 
-            trayIcon.ContextMenuStrip.Items.Add("Reiniciar Driver de Video", null, (s, e) => TriggerVideoReset());
+            trayIcon.ContextMenuStrip.Items.Add("Reiniciar GPU (Estilo Restart64)", null, async (s, e) => await ForceGPURestart());
             trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
             trayIcon.ContextMenuStrip.Items.Add("Salir", null, Exit);
 
-            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
 
             statusTimer = new System.Windows.Forms.Timer();
             statusTimer.Interval = 2000;
@@ -150,14 +110,10 @@ namespace X20Guard
 
         private void StatusTimer_Tick(object? sender, EventArgs e)
         {
-            try
+            if (!isProcessingChange)
             {
-                UpdateStatus();
-            }
-            catch (Exception ex)
-            {
-                // Si la lectura de pantalla falla temporalmente, no queremos que se cierre.
-                Program.LogFatalError(new Exception("Error no fatal en UpdateStatus", ex));
+                try { UpdateStatus(); }
+                catch (Exception ex) { Program.LogFatalError(new Exception("Error en UpdateStatus", ex)); }
             }
         }
 
@@ -193,51 +149,95 @@ namespace X20Guard
             }
         }
 
-        private async void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        private async void OnDisplaySettingsChanged(object? sender, EventArgs e)
         {
-            if (e.Mode == PowerModes.Resume)
-            {
-                try
-                {
-                    await Task.Delay(4000);
+            // SISTEMA ANTI-REBOTE EXTENDIDO: Reiniciar la GPU dispara MUCHOS eventos de pantalla
+            if (isProcessingChange || (DateTime.Now - lastEventTime).TotalSeconds < 10) return;
 
-                    DEVMODE vDevMode = new DEVMODE();
-                    vDevMode.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            isProcessingChange = true;
+            lastEventTime = DateTime.Now;
 
-                    if (EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref vDevMode))
-                    {
-                        if (vDevMode.dmPelsWidth == 1440 && vDevMode.dmPelsHeight == 900 && vDevMode.dmDisplayFrequency < 97)
-                        {
-                            TriggerVideoReset();
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // Si ocurre un error durante la reanudación de energía, queda registrado
-                    // y el programa SOBREVIVE.
-                    Program.LogFatalError(new Exception("Error al despertar de la suspensión", ex));
-                }
-            }
-        }
-
-        private void TriggerVideoReset()
-        {
             try
             {
-                keybd_event(VK_LWIN, 0, 0, 0);
-                keybd_event(VK_CONTROL, 0, 0, 0);
-                keybd_event(VK_SHIFT, 0, 0, 0);
-                keybd_event(VK_B, 0, 0, 0);
+                // Le damos tiempo a Windows para que asimile la suspensión
+                await Task.Delay(4000);
 
-                keybd_event(VK_B, 0, KEYEVENTF_KEYUP, 0);
-                keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
-                keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-                keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+                DEVMODE vDevMode = new DEVMODE();
+                vDevMode.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+
+                if (EnumDisplaySettings(null, ENUM_CURRENT_SETTINGS, ref vDevMode))
+                {
+                    // Si el monitor despertó a 60Hz...
+                    if (vDevMode.dmPelsWidth == 1440 && vDevMode.dmPelsHeight == 900 && vDevMode.dmDisplayFrequency < 97)
+                    {
+                        await ForceGPURestart();
+                    }
+                }
             }
             catch (Exception ex)
             {
-                Program.LogFatalError(new Exception("Fallo al ejecutar Win+Ctrl+Shift+B", ex));
+                Program.LogFatalError(new Exception("Error al detectar cambio de pantalla", ex));
+            }
+            finally
+            {
+                lastEventTime = DateTime.Now;
+                isProcessingChange = false;
+            }
+        }
+
+        // --- NUESTRO PROPIO RESTART64 NATIVO ---
+        private async Task ForceGPURestart()
+        {
+            try
+            {
+                string? gpuPnpId = null;
+
+                // 1. Encontrar el ID de Hardware de la Tarjeta Gráfica (Intel)
+                using (var searcher = new ManagementObjectSearcher("SELECT PNPDeviceID, Name FROM Win32_VideoController"))
+                {
+                    foreach (var device in searcher.Get())
+                    {
+                        string name = device["Name"]?.ToString() ?? "";
+                        // Filtramos por Intel (o tomamos la que esté si solo hay una)
+                        if (name.IndexOf("Intel", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            gpuPnpId = device["PNPDeviceID"]?.ToString();
+                            break;
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(gpuPnpId))
+                {
+                    // 2. Ejecutar pnputil para reiniciar LA TARJETA GRÁFICA (Igual que Restart64)
+                    ProcessStartInfo psi = new ProcessStartInfo
+                    {
+                        FileName = "pnputil.exe",
+                        Arguments = $"/restart-device \"{gpuPnpId}\"",
+                        CreateNoWindow = true,
+                        WindowStyle = ProcessWindowStyle.Hidden,
+                        UseShellExecute = false
+                    };
+
+                    using (Process? p = Process.Start(psi))
+                    {
+                        if (p != null)
+                        {
+                            await Task.Run(() => p.WaitForExit());
+                        }
+                    }
+
+                    // 3. Pausa larga para que Windows termine de reconstruir el driver WDDM
+                    await Task.Delay(8000);
+                }
+                else
+                {
+                    Program.LogFatalError(new Exception("No se detectó la tarjeta gráfica Intel en WMI."));
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.LogFatalError(new Exception("Fallo al intentar reiniciar la GPU", ex));
             }
         }
 
@@ -247,14 +247,8 @@ namespace X20Guard
             using (Graphics g = Graphics.FromImage(bitmap))
             {
                 g.Clear(Color.Transparent);
-                using (Brush brush = new SolidBrush(color))
-                {
-                    g.FillEllipse(brush, 2, 2, 12, 12);
-                }
-                using (Pen pen = new Pen(Color.Black, 1))
-                {
-                    g.DrawEllipse(pen, 2, 2, 12, 12);
-                }
+                using (Brush brush = new SolidBrush(color)) { g.FillEllipse(brush, 2, 2, 12, 12); }
+                using (Pen pen = new Pen(Color.Black, 1)) { g.DrawEllipse(pen, 2, 2, 12, 12); }
             }
             return Icon.FromHandle(bitmap.GetHicon());
         }
@@ -263,7 +257,7 @@ namespace X20Guard
         {
             statusTimer.Stop();
             trayIcon.Visible = false;
-            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             Application.Exit();
         }
     }
